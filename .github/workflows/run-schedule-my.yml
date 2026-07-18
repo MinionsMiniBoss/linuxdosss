@@ -116,19 +116,54 @@ jobs:
           pip install DrissionPage
 
       # ── 安装 mihomo (Clash Meta) ──
+      # 用 gh + GITHUB_TOKEN，避免匿名 api.github.com 限流导致 .assets=null、jq 报错
       - name: Install mihomo
         if: ${{ github.event.inputs.use_proxy != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          DOWNLOAD_URL=$(curl -sL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | \
-            jq -r '.assets[]
-              | select(.name | test("linux-amd64"))
-              | select(.name | test("compatible|freebsd|android|windows|darwin|mips|arm|386|loong|riscv|s390") | not)
-              | .browser_download_url' | head -1)
-          echo "Download: $DOWNLOAD_URL"
-          wget -q "$DOWNLOAD_URL" -O /tmp/mihomo.gz
-          gunzip /tmp/mihomo.gz
-          chmod +x /tmp/mihomo
-          sudo mv /tmp/mihomo /usr/local/bin/mihomo
+          set -euo pipefail
+
+          TAG=$(gh api repos/MetaCubeX/mihomo/releases/latest --jq .tag_name)
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "[-] 无法获取 mihomo 最新版本 tag"
+            exit 1
+          fi
+          echo "[*] mihomo latest: $TAG"
+
+          # 标准二进制：mihomo-linux-amd64-vX.Y.Z.gz
+          ASSET="mihomo-linux-amd64-${TAG}.gz"
+          echo "[+] Download asset: $ASSET"
+
+          rm -rf /tmp/mihomo-dl
+          mkdir -p /tmp/mihomo-dl
+
+          if ! gh release download "$TAG" \
+              -R MetaCubeX/mihomo \
+              -p "$ASSET" \
+              -D /tmp/mihomo-dl; then
+            echo "[!] 精确资产下载失败，尝试匹配 linux-amd64*.gz ..."
+            # 列出候选资产并选最合适的一个
+            CANDIDATE=$(gh api "repos/MetaCubeX/mihomo/releases/tags/${TAG}" \
+              --jq '.assets[].name
+                | select(test("linux-amd64"))
+                | select(endswith(".gz"))
+                | select(test("compatible|go1|freebsd|android|windows|darwin|mips|arm64|armv|386|loong|riscv|s390") | not)' \
+              | head -1)
+            if [ -z "${CANDIDATE:-}" ]; then
+              echo "[-] 未找到可用的 mihomo linux-amd64 资产"
+              gh api "repos/MetaCubeX/mihomo/releases/tags/${TAG}" --jq '.assets[].name' | head -40
+              exit 1
+            fi
+            echo "[+] Fallback asset: $CANDIDATE"
+            gh release download "$TAG" -R MetaCubeX/mihomo -p "$CANDIDATE" -D /tmp/mihomo-dl
+            ASSET="$CANDIDATE"
+          fi
+
+          gunzip -f "/tmp/mihomo-dl/${ASSET}"
+          BIN="/tmp/mihomo-dl/${ASSET%.gz}"
+          chmod +x "$BIN"
+          sudo mv "$BIN" /usr/local/bin/mihomo
           mihomo -v
 
       # ── 启动代理（主流程前才启动，仅脚本运行期间占用节点）──
