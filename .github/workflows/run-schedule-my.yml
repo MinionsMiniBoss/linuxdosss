@@ -1,0 +1,356 @@
+# ================================================================================
+# Linux.do 自动浏览定时任务（Cookie 登录 + mihomo 代理 + 邮件通知）
+# ================================================================================
+#
+# 功能：
+#   - 定时 / 手动触发自动浏览
+#   - Cookie 登录优先（规避 GitHub IP 触发的 hCaptcha）
+#   - 账号密码登录兜底
+#   - mihomo (Clash Meta) 代理，降低 GitHub 出口 IP 风控
+#   - 运行结束后邮件通知结果
+#
+# ================================================================================
+# 使用说明
+# ================================================================================
+#
+# 1. Fork 本仓库到你的账号，并设为私有
+#    Settings -> General -> Danger Zone -> Change visibility -> Make private
+#
+# 2. 添加 Secrets（Settings -> Secrets and variables -> Actions）
+#
+#    登录相关（至少配置一种）：
+#    - LINUXDO_COOKIE: 浏览器 Cookie（推荐）
+#        格式: _t=xxx; _forum_session=yyy
+#        获取: 登录 linux.do 后 F12 -> Application -> Cookies -> 复制
+#    - LINUXDO_USERNAME / LINUXDO_PASSWORD: 账号密码（Cookie 失效时兜底）
+#
+#    代理相关（推荐）：
+#    - CLASH_CONFIG_URL: Clash/mihomo 订阅地址
+#
+#    邮件通知（可选，不配则跳过发信）：
+#    - SMTP_USER: 发件邮箱
+#    - SMTP_PASSWORD: 邮箱授权码 / 应用专用密码
+#    - SMTP_TO: 收件邮箱
+#    - SMTP_HOST: SMTP 服务器，默认 smtp.gmail.com
+#    - SMTP_PORT: SMTP 端口，默认 465
+#
+# 3. 启用 Actions
+#    Actions -> I understand my workflows, go ahead and enable them
+#
+# 4. 手动触发或等待定时任务
+#    Actions -> Run Schedule my -> Run workflow
+#
+# ================================================================================
+# 定时规则说明
+# ================================================================================
+#
+# cron 格式: 分 时 日 月 周
+# GitHub Actions 使用 UTC 时间，北京时间 = UTC + 8
+#
+# 示例：
+#   '0 0 * * *'   - 每天 UTC 0:00（北京时间 8:00）
+#   '0 12 * * *'  - 每天 UTC 12:00（北京时间 20:00）
+#
+# ================================================================================
+
+name: Run Schedule my
+
+on:
+  # 定时触发已禁用（按需取消注释）
+  # schedule:
+  #   - cron: '0 0 * * *'   # UTC 0:00 = 北京时间 8:00
+  #   - cron: '0 12 * * *'  # UTC 12:00 = 北京时间 20:00
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      topics:
+        description: '浏览帖子数量'
+        required: false
+        default: '30'
+      like_rate:
+        description: '点赞概率 (0-100)'
+        required: false
+        default: '30'
+      use_proxy:
+        description: '是否启用 mihomo 代理'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  browse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 系统依赖（jq 用于解析 mihomo release）──
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      # ── 安装 Chrome ──
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      # ── Python（直连安装依赖，不走代理，节省节点流量）──
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install DrissionPage
+
+      # ── 安装 mihomo (Clash Meta) ──
+      - name: Install mihomo
+        if: ${{ github.event.inputs.use_proxy != 'false' }}
+        run: |
+          DOWNLOAD_URL=$(curl -sL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | \
+            jq -r '.assets[]
+              | select(.name | test("linux-amd64"))
+              | select(.name | test("compatible|freebsd|android|windows|darwin|mips|arm|386|loong|riscv|s390") | not)
+              | .browser_download_url' | head -1)
+          echo "Download: $DOWNLOAD_URL"
+          wget -q "$DOWNLOAD_URL" -O /tmp/mihomo.gz
+          gunzip /tmp/mihomo.gz
+          chmod +x /tmp/mihomo
+          sudo mv /tmp/mihomo /usr/local/bin/mihomo
+          mihomo -v
+
+      # ── 启动代理（主流程前才启动，仅脚本运行期间占用节点）──
+      # CLASH_CONFIG_URL 由仓库 Secret 注入；未配置时跳过代理继续直连
+      - name: Start mihomo proxy
+        id: proxy
+        if: ${{ github.event.inputs.use_proxy != 'false' }}
+        env:
+          CLASH_CONFIG_URL: ${{ secrets.CLASH_CONFIG_URL }}
+        run: |
+          set -eu
+          if [ -z "${CLASH_CONFIG_URL}" ]; then
+            echo "[!] 未配置 CLASH_CONFIG_URL secret，跳过代理，使用直连"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mkdir -p /tmp/mihomo
+          echo "[*] Clash 订阅: ${CLASH_CONFIG_URL:0:48}..."
+          curl -sL "$CLASH_CONFIG_URL" -o /tmp/mihomo/config.yaml
+          echo "[+] Clash config downloaded"
+
+          nohup mihomo -d /tmp/mihomo > /tmp/mihomo/mihomo.log 2>&1 &
+          echo "MIHOMO_PID=$!" >> "$GITHUB_ENV"
+          sleep 8
+
+          for i in 1 2 3 4 5; do
+            RESULT=$(curl -x http://127.0.0.1:7890 -sL --connect-timeout 10 https://httpbin.org/ip 2>/dev/null || true)
+            if [ -n "$RESULT" ]; then
+              echo "[+] Proxy OK — exit IP: $RESULT"
+              echo "enabled=true" >> "$GITHUB_OUTPUT"
+              echo "PROXY_URL=http://127.0.0.1:7890" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "[!] Attempt $i failed, retrying..."
+            sleep 3
+          done
+
+          echo "[-] Proxy unreachable，将回退直连"
+          cat /tmp/mihomo/mihomo.log || true
+          kill "$MIHOMO_PID" 2>/dev/null || true
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          # 不 fail job，允许直连继续（Cookie 登录通常仍可用）
+
+      # ── 执行浏览脚本 ──
+      # 成功标准：日志出现「任务完成」且浏览帖子数 > 0
+      # 不用 steps.outcome：`python | tee` 默认取 tee 的退出码(0)
+      - name: Run browse script
+        id: browse
+        env:
+          LINUXDO_COOKIE: ${{ secrets.LINUXDO_COOKIE }}
+          LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
+          LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
+        run: |
+          set -o pipefail
+
+          TOPICS="${{ github.event.inputs.topics || '5' }}"
+          LIKE_RATE="${{ github.event.inputs.like_rate || '10' }}"
+
+          # 登录方式提示
+          if [ -n "${LINUXDO_COOKIE}" ]; then
+            LOGIN_HINT="Cookie（优先）"
+          elif [ -n "${LINUXDO_USERNAME}" ] && [ -n "${LINUXDO_PASSWORD}" ]; then
+            LOGIN_HINT="账号密码"
+          else
+            echo "[-] 未配置 LINUXDO_COOKIE 或 LINUXDO_USERNAME/PASSWORD"
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          PROXY_ARGS=()
+          if [ -n "${PROXY_URL:-}" ]; then
+            PROXY_ARGS=(--proxy "$PROXY_URL")
+            PROXY_HINT="$PROXY_URL"
+          else
+            PROXY_HINT="直连"
+          fi
+
+          echo "========================================"
+          echo "开始运行 Linux.do 自动浏览"
+          echo "目标帖子数: $TOPICS"
+          echo "点赞概率: $LIKE_RATE%"
+          echo "登录方式: $LOGIN_HINT"
+          echo "网络: $PROXY_HINT"
+          echo "========================================"
+
+          python linux_do_headless.py \
+            --topics "$TOPICS" \
+            --like-rate "$LIKE_RATE" \
+            --debug \
+            "${PROXY_ARGS[@]}" \
+            2>&1 | tee /tmp/run.log
+
+          # 判定成功：出现任务完成，且浏览帖子 > 0
+          if grep -qE "任务完成" /tmp/run.log && grep -qE "浏览帖子: [1-9][0-9]*" /tmp/run.log; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          elif grep -qE "Cookie 登录成功|账号密码登录成功|登录成功" /tmp/run.log && \
+               grep -qE "浏览帖子: 0" /tmp/run.log; then
+            # 登录成功但没浏览到帖子，标记为 partial
+            echo "result=partial" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+          fi
+        continue-on-error: true
+
+      # ── 主流程结束立即停代理，后续邮件走直连 ──
+      - name: Stop mihomo proxy
+        if: always()
+        run: kill "${MIHOMO_PID:-}" 2>/dev/null || true
+
+      # ── 邮件通知 ──
+      # SMTP 凭证走 GitHub Actions secret；未配置则跳过
+      - name: Send email notification
+        if: always()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          BROWSE_RESULT: ${{ steps.browse.outputs.result }}
+        run: |
+          if [ -z "${SMTP_USER}" ] || [ -z "${SMTP_PASSWORD}" ] || [ -z "${SMTP_TO}" ]; then
+            echo "[!] 未完整配置 SMTP_USER / SMTP_PASSWORD / SMTP_TO，跳过邮件通知"
+            exit 0
+          fi
+
+          python3 - \
+            "${{ github.run_number }}" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "${{ github.event.inputs.topics || '30' }}" \
+            "${{ github.event.inputs.like_rate || '30' }}" \
+            <<'PYEOF'
+          import smtplib, sys, os, re
+          from email.mime.text import MIMEText
+          from datetime import datetime, timezone, timedelta
+
+          run_num, run_url, topics, like_rate = sys.argv[1:5]
+          result = os.environ.get("BROWSE_RESULT") or "failed"
+          ok = result == "success"
+          partial = result == "partial"
+
+          if ok:
+              emoji, label = "✅", "SUCCESS"
+          elif partial:
+              emoji, label = "⚠️", "PARTIAL"
+          else:
+              emoji, label = "❌", "FAILED"
+
+          bj = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M CST")
+
+          log = ""
+          try:
+              with open("/tmp/run.log") as f:
+                  log = f.read()
+          except Exception:
+              log = "No log available"
+
+          # 从日志提取关键统计
+          def pick(pattern, default="-"):
+              m = re.search(pattern, log)
+              return m.group(1) if m else default
+
+          login_method = pick(r"登录方式:\s*(\S+)")
+          browsed = pick(r"浏览帖子:\s*(\d+)")
+          likes = pick(r"点赞数:\s*(\d+)")
+          scrolls = pick(r"滚动次数:\s*(\d+)")
+          elapsed = pick(r"用时:\s*([^\n]+)")
+
+          body = (
+              f"Linux.do Auto Browse Report\n"
+              f"============================\n"
+              f"Result:   {label}\n"
+              f"Run:      #{run_num}\n"
+              f"Time:     {bj}\n"
+              f"Topics:   {topics}\n"
+              f"LikeRate: {like_rate}%\n"
+              f"Login:    {login_method}\n"
+              f"Browsed:  {browsed}\n"
+              f"Likes:    {likes}\n"
+              f"Scrolls:  {scrolls}\n"
+              f"Elapsed:  {elapsed}\n"
+              f"Workflow: {run_url}\n"
+              f"\n--- Run Log ---\n"
+              f"{log}\n"
+          )
+
+          msg = MIMEText(body, "plain", "utf-8")
+          msg["From"] = os.environ["SMTP_USER"]
+          msg["To"] = os.environ["SMTP_TO"]
+          msg["Subject"] = f"{emoji} Linux.do Browse: {label} (#{run_num})"
+
+          smtp_host = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
+          smtp_port = int(os.environ.get("SMTP_PORT") or "465")
+          with smtplib.SMTP_SSL(smtp_host, smtp_port) as s:
+              s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+              s.send_message(msg)
+          print(f"[+] Email sent: {label}")
+          PYEOF
+
+      # ── 输出结果摘要 ──
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 运行结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 触发方式: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 运行结果: ${{ steps.browse.outputs.result || 'unknown' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 代理: ${{ steps.proxy.outputs.enabled || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 运行时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- 北京时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f /tmp/run.log ]; then
+            echo "### 日志摘要" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 40 /tmp/run.log >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ── 浏览失败时让 job 标记为失败 ──
+      - name: Fail if browse failed
+        if: always() && steps.browse.outputs.result == 'failed'
+        run: |
+          echo "浏览任务失败，详见上方日志与邮件通知"
+          exit 1
