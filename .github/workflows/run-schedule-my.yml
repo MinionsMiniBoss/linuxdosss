@@ -57,7 +57,8 @@ name: Run Schedule my
 
 on:
   # 定时触发已禁用（按需取消注释）
-  # schedule:
+  schedule:
+    - cron: '5 4 * * *'   # UTC 0:00 = 北京时间 12:05
   #   - cron: '0 0 * * *'   # UTC 0:00 = 北京时间 8:00
   #   - cron: '0 12 * * *'  # UTC 12:00 = 北京时间 20:00
 
@@ -67,11 +68,11 @@ on:
       topics:
         description: '浏览帖子数量'
         required: false
-        default: '30'
+        default: '10'
       like_rate:
         description: '点赞概率 (0-100)'
         required: false
-        default: '30'
+        default: '10'
       use_proxy:
         description: '是否启用 mihomo 代理'
         required: false
