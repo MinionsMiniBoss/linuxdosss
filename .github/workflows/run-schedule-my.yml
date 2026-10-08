@@ -68,7 +68,7 @@ on:
       topics:
         description: '浏览帖子数量'
         required: false
-        default: '10'
+        default: '30'
       like_rate:
         description: '点赞概率 (0-100)'
         required: false
