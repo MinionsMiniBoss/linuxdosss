@@ -221,7 +221,8 @@ jobs:
         run: |
           set -o pipefail
 
-          TOPICS="${{ github.event.inputs.topics || '5' }}"
+          # schedule 触发时没有 inputs，走 || 后的兜底值（与 workflow_dispatch default 保持一致）
+          TOPICS="${{ github.event.inputs.topics || '30' }}"
           LIKE_RATE="${{ github.event.inputs.like_rate || '10' }}"
 
           # 登录方式提示
@@ -296,7 +297,7 @@ jobs:
             "${{ github.run_number }}" \
             "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             "${{ github.event.inputs.topics || '30' }}" \
-            "${{ github.event.inputs.like_rate || '30' }}" \
+            "${{ github.event.inputs.like_rate || '10' }}" \
             <<'PYEOF'
           import smtplib, sys, os, re
           from email.mime.text import MIMEText
